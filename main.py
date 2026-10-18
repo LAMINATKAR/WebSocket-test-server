@@ -4,9 +4,9 @@
 ║           WebSocket test server — ws:// and wss://           ║
 ╠══════════════════════════════════════════════════════════════╣
 ║  Install:                                                    ║
-║    pip install websockets cryptography                       ║
+║    pip install -r requirements.txt                           ║
 ║                                                              ║
-║  Script parameters (PyCharm Run → Edit Configurations):      ║
+║  Script parameters:                                          ║
 ║    (empty)             both ports, authentication ON         ║
 ║    --ws                ws:// only, authentication ON         ║
 ║    --wss               wss:// only, authentication ON        ║
@@ -14,6 +14,7 @@
 ║    --no-auth           both ports, authentication OFF        ║
 ║    --ws --no-auth      ws:// only, authentication OFF        ║
 ║    --wss --no-auth     wss:// only, authentication OFF       ║
+║    --host ADDR         bind address (default 0.0.0.0)        ║
 ║                                                              ║
 ║  Addresses:                                                  ║
 ║    ws://localhost:8765                                       ║
@@ -34,16 +35,16 @@
 import asyncio
 import argparse
 import base64
+import hmac
 import logging
 import os
 import ssl
-from datetime import datetime
 
 import websockets
 try:
-    from websockets.server import ServerConnection as WebSocketServerProtocol  # v12+
+    from websockets.asyncio.server import ServerConnection as WebSocketServerProtocol  # v13+
 except ImportError:
-    from websockets.legacy.server import WebSocketServerProtocol               # v10/11
+    from websockets.legacy.server import WebSocketServerProtocol                       # v10–12
 
 # ── logging ──────────────────────────────────────────────────────────────────
 
@@ -94,19 +95,20 @@ def make_cert():
         from cryptography.x509.oid import NameOID
         from cryptography.hazmat.primitives import hashes, serialization
         from cryptography.hazmat.primitives.asymmetric import rsa
-        import datetime
+        from datetime import datetime, timedelta, timezone
 
         log.info("TLS  generating self-signed certificate (cryptography)...")
         key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+        now = datetime.now(timezone.utc)
         cert = (
             x509.CertificateBuilder()
             .subject_name(name)
             .issuer_name(name)
             .public_key(key.public_key())
             .serial_number(x509.random_serial_number())
-            .not_valid_before(datetime.datetime.utcnow())
-            .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=365))
+            .not_valid_before(now)
+            .not_valid_after(now + timedelta(days=365))
             .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False)
             .sign(key, hashes.SHA256())
         )
@@ -133,7 +135,7 @@ def build_ssl_context() -> ssl.SSLContext:
 
 # ── auth ─────────────────────────────────────────────────────────────────────
 
-def check_basic_auth(headers: dict) -> tuple[bool, str]:
+def check_basic_auth(headers) -> tuple[bool, str]:
     """Returns (ok, username). If failed, username contains the reason."""
     raw = headers.get("Authorization", "")
     if not raw.lower().startswith("basic "):
@@ -145,7 +147,7 @@ def check_basic_auth(headers: dict) -> tuple[bool, str]:
         return False, "invalid Base64 / format"
     if user not in USERS:
         return False, f"unknown user '{user}'"
-    if USERS[user] != pwd:
+    if not hmac.compare_digest(USERS[user].encode(), pwd.encode()):
         return False, f"wrong password for '{user}'"
     return True, user
 
@@ -174,20 +176,19 @@ async def handler(ws: WebSocketServerProtocol, auth: bool):
     log.info(f"     path       : {path}")
     log.info(f"     subprotocol: {subprotocol}")
 
-    hdrs = dict(getattr(ws, "request_headers", None) or ws.request.headers)
+    # keep the Headers object: it is case-insensitive, dict() would lowercase the keys
+    hdrs = getattr(ws, "request_headers", None) or ws.request.headers
     for h in ("Host", "Origin", "Upgrade", "Connection",
               "Sec-WebSocket-Key", "Sec-WebSocket-Version",
               "Sec-WebSocket-Extensions", "User-Agent", "Authorization"):
         if h in hdrs:
             val = hdrs[h]
             if h == "Authorization":
-                val = val[:10] + "…"
+                val = val[:10] + "…"   # don't log credentials
             log.info(f"     {h:<28}: {val}")
 
     # ── authentication ───────────────────────────────────────────────────────
     if auth:
-        raw_auth = hdrs.get("Authorization", "")
-        log.info(f"{proto} AUTH HEADER {addr}  Authorization: '{raw_auth[:60] or '—'}'")
         ok, user_or_reason = check_basic_auth(hdrs)
         if not ok:
             log.warning(f"{proto} AUTH FAIL   {addr}  → {user_or_reason}")
@@ -208,8 +209,9 @@ async def handler(ws: WebSocketServerProtocol, auth: bool):
     # ── keep connection alive ────────────────────────────────────────────────
     try:
         async for raw in ws:
-            preview = raw[:240] + ("…" if len(raw) > 240 else "")
-            log.info(f"{proto} MESSAGE     {addr}  {preview!r}")
+            kind = "TEXT" if isinstance(raw, str) else "BINARY"
+            more = f" … ({len(raw)} total)" if len(raw) > 240 else ""
+            log.info(f"{proto} MESSAGE     {addr}  {kind} {raw[:240]!r}{more}")
 
     except websockets.exceptions.ConnectionClosedOK as e:
         log.info(f"{proto} CLOSE OK    {addr}  code={e.code}  reason={e.reason!r}")
@@ -225,19 +227,19 @@ async def handler(ws: WebSocketServerProtocol, auth: bool):
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
-async def main(mode: str, auth: bool):
+async def main(mode: str, auth: bool, host: str):
     servers = []
 
     if mode in ("ws", "both"):
-        srv = await websockets.serve(lambda ws: handler(ws, auth), "0.0.0.0", WS_PORT)
+        srv = await websockets.serve(lambda ws: handler(ws, auth), host, WS_PORT)
         servers.append(srv)
-        log.info(f"Listening  ws://localhost:{WS_PORT}")
+        log.info(f"Listening  ws://{host}:{WS_PORT}")
 
     if mode in ("wss", "both"):
         ssl_ctx = build_ssl_context()
-        srv = await websockets.serve(lambda ws: handler(ws, auth), "0.0.0.0", WSS_PORT, ssl=ssl_ctx)
+        srv = await websockets.serve(lambda ws: handler(ws, auth), host, WSS_PORT, ssl=ssl_ctx)
         servers.append(srv)
-        log.info(f"Listening  wss://localhost:{WSS_PORT}  (self-signed cert)")
+        log.info(f"Listening  wss://{host}:{WSS_PORT}  (self-signed cert)")
 
     log.info(f"Authentication: {'ON' if auth else 'OFF'}")
     log.info(f"Logs also saved to → {LOG_FILE}")
@@ -254,12 +256,14 @@ if __name__ == "__main__":
     grp.add_argument("--both", action="store_true", help="ws:// and wss://")
     grp.add_argument("--ws",   action="store_true", help="ws:// only")
     parser.add_argument("--no-auth", action="store_true", help="disable authentication")
+    parser.add_argument("--host", default="0.0.0.0",
+                        help="bind address (default 0.0.0.0 = all interfaces, use 127.0.0.1 for local only)")
     args = parser.parse_args()
 
-    mode = "wss" if args.wss else ("ws" if args.ws else ("both" if args.both else "both"))
+    mode = "wss" if args.wss else ("ws" if args.ws else "both")
     AUTH_ENABLED = not args.no_auth
 
     try:
-        asyncio.run(main(mode, AUTH_ENABLED))
+        asyncio.run(main(mode, AUTH_ENABLED, args.host))
     except KeyboardInterrupt:
         log.info("Server stopped.")
